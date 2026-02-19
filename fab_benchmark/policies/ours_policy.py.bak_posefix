@@ -1,0 +1,828 @@
+"""Ours policy (Tier‑1 + posterior) with grid navigation.
+
+This repo's original Coverage / Ours controllers are *goal-heading* controllers:
+- turn toward goal
+- drive forward
+
+In maze layouts this often causes the robot to repeatedly hit walls/door frames,
+get stuck, and therefore fail to reach the leak within the time budget.
+
+This version keeps the exact same *high-level* decision logic (Tier‑1 focus +
+posterior room mass + coverage tour), but replaces the low-level motion with:
+- occupancy-grid A* (on the scenario_spec_assumed map)
+- obstacle inflation (robot footprint + margin)
+- line-of-sight lookahead along the path
+- safer controller: rotate-in-place when heading error is large
+- stuck recovery (rotate and re-plan)
+
+All parameters are configurable via policy_cfg.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+from fab_benchmark.policies.base_policy import Policy
+from fab_benchmark.scenarios.base_scenario import (
+    grid_to_world,
+    reconstruct_layout_from_spec,
+    world_to_grid,
+)
+
+
+# ----------------------------- small helpers -----------------------------
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap_pi(a: float) -> float:
+    # wrap to (-pi, pi]
+    while a <= -math.pi:
+        a += 2.0 * math.pi
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    return a
+
+
+def _hypot2(dx: float, dy: float) -> float:
+    return dx * dx + dy * dy
+
+
+def _bresenham(i0: int, j0: int, i1: int, j1: int) -> List[Tuple[int, int]]:
+    """Grid line cells from (i0,j0) to (i1,j1) inclusive."""
+    cells: List[Tuple[int, int]] = []
+    di = abs(i1 - i0)
+    dj = abs(j1 - j0)
+    si = 1 if i0 < i1 else -1
+    sj = 1 if j0 < j1 else -1
+    err = (dj - di) if di >= dj else (di - dj)
+
+    i, j = i0, j0
+    if di >= dj:
+        # i-major
+        e = dj - di
+        while True:
+            cells.append((i, j))
+            if i == i1 and j == j1:
+                break
+            e2 = 2 * e
+            if e2 >= -di:
+                e -= di
+                j += sj
+            e += dj
+            i += si
+    else:
+        # j-major
+        e = di - dj
+        while True:
+            cells.append((i, j))
+            if i == i1 and j == j1:
+                break
+            e2 = 2 * e
+            if e2 >= -dj:
+                e -= dj
+                i += si
+            e += di
+            j += sj
+
+    return cells
+
+
+def _inflate_occ(occ: np.ndarray, rad_cells: int) -> np.ndarray:
+    """Inflate obstacles in occ (0 free, nonzero obstacle) by rad_cells."""
+    if rad_cells <= 0:
+        return occ.astype(np.uint8, copy=True)
+
+    occ = occ.astype(np.uint8, copy=False)
+    obs = occ != 0
+    h, w = occ.shape
+    out = np.zeros((h, w), dtype=np.uint8)
+
+    r2 = rad_cells * rad_cells
+    for di in range(-rad_cells, rad_cells + 1):
+        for dj in range(-rad_cells, rad_cells + 1):
+            if di * di + dj * dj > r2:
+                continue
+            si0 = max(0, -di)
+            sj0 = max(0, -dj)
+            si1 = min(h, h - di)
+            sj1 = min(w, w - dj)
+            if si0 >= si1 or sj0 >= sj1:
+                continue
+            out[si0:si1, sj0:sj1] |= obs[si0 + di : si1 + di, sj0 + dj : sj1 + dj]
+
+    inflated = (out != 0).astype(np.uint8)
+    return inflated
+
+
+def _snap_to_free(i: int, j: int, occ: np.ndarray, max_r: int = 25) -> Optional[Tuple[int, int]]:
+    """If (i,j) is blocked, BFS outward for nearest free cell."""
+    h, w = occ.shape
+    if 0 <= i < h and 0 <= j < w and occ[i, j] == 0:
+        return (i, j)
+
+    q: Deque[Tuple[int, int, int]] = deque()
+    seen = set()
+    q.append((i, j, 0))
+    seen.add((i, j))
+
+    neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    while q:
+        ci, cj, d = q.popleft()
+        if d > max_r:
+            continue
+        if 0 <= ci < h and 0 <= cj < w and occ[ci, cj] == 0:
+            return (ci, cj)
+        for di, dj in neigh:
+            ni, nj = ci + di, cj + dj
+            if (ni, nj) in seen:
+                continue
+            seen.add((ni, nj))
+            q.append((ni, nj, d + 1))
+
+    return None
+
+
+def _astar_grid(
+    occ: np.ndarray,
+    start: Tuple[int, int],
+    goal: Tuple[int, int],
+    max_expansions: int = 100_000,
+) -> Optional[List[Tuple[int, int]]]:
+    """A* on 4-neighbor grid. occ: 0 free, nonzero obstacle."""
+    h, w = occ.shape
+    si, sj = start
+    gi, gj = goal
+    if not (0 <= si < h and 0 <= sj < w and 0 <= gi < h and 0 <= gj < w):
+        return None
+    if occ[si, sj] != 0 or occ[gi, gj] != 0:
+        return None
+    if start == goal:
+        return [start]
+
+    # Use arrays for speed.
+    g = np.full((h, w), np.inf, dtype=np.float32)
+    parent_i = np.full((h, w), -1, dtype=np.int16)
+    parent_j = np.full((h, w), -1, dtype=np.int16)
+
+    def hfun(i: int, j: int) -> float:
+        return float(abs(i - gi) + abs(j - gj))
+
+    pq: List[Tuple[float, float, int, int]] = []
+    g[si, sj] = 0.0
+    heapq.heappush(pq, (hfun(si, sj), 0.0, si, sj))
+
+    expansions = 0
+    neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    while pq and expansions < max_expansions:
+        f, gc, i, j = heapq.heappop(pq)
+        if gc != g[i, j]:
+            continue
+        expansions += 1
+        if (i, j) == (gi, gj):
+            break
+        for di, dj in neigh:
+            ni, nj = i + di, j + dj
+            if ni < 0 or ni >= h or nj < 0 or nj >= w:
+                continue
+            if occ[ni, nj] != 0:
+                continue
+            ng = gc + 1.0
+            if ng < g[ni, nj]:
+                g[ni, nj] = ng
+                parent_i[ni, nj] = i
+                parent_j[ni, nj] = j
+                heapq.heappush(pq, (ng + hfun(ni, nj), ng, ni, nj))
+
+    if parent_i[gi, gj] == -1:
+        return None
+
+    # Reconstruct
+    path: List[Tuple[int, int]] = []
+    i, j = gi, gj
+    path.append((i, j))
+    while (i, j) != (si, sj):
+        pi, pj = int(parent_i[i, j]), int(parent_j[i, j])
+        if pi < 0 or pj < 0:
+            return None
+        i, j = pi, pj
+        path.append((i, j))
+    path.reverse()
+    return path
+
+
+def _compress_path_cells(cells: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Keep only turns (direction changes) + endpoints."""
+    if len(cells) <= 2:
+        return list(cells)
+    out: List[Tuple[int, int]] = [cells[0]]
+    prev_di = cells[1][0] - cells[0][0]
+    prev_dj = cells[1][1] - cells[0][1]
+    for k in range(1, len(cells) - 1):
+        di = cells[k + 1][0] - cells[k][0]
+        dj = cells[k + 1][1] - cells[k][1]
+        if di != prev_di or dj != prev_dj:
+            out.append(cells[k])
+        prev_di, prev_dj = di, dj
+    out.append(cells[-1])
+    return out
+
+
+# ----------------------------- OursPolicy -----------------------------
+
+
+@dataclass
+class _NavPath:
+    goal_xy: Tuple[float, float]
+    cells: List[Tuple[int, int]]
+    xy: List[Tuple[float, float]]
+    idx: int
+    planned_t: float
+
+
+class OursPolicy(Policy):
+    """Tier‑1 + posterior room-mass policy with navigation."""
+
+    def __init__(self, policy_cfg: Dict[str, Any], sim_params: Dict[str, Any]):
+        super().__init__(policy_cfg, sim_params)
+
+        # High-level config (keep consistent with previous versions)
+        self._plan_hz = float(policy_cfg.get("plan_hz", 10.0))
+        self._visit_tol = float(policy_cfg.get("visit_tol", 0.6))
+        self._commit_min_s = float(policy_cfg.get("commit_min_s", 3.0))
+        self._focus_on_tier1 = bool(policy_cfg.get("focus_on_tier1", True))
+        self._focus_max_hold_s = float(policy_cfg.get("focus_max_hold_s", 15.0))
+        self._focus_queue_max = int(policy_cfg.get("focus_queue_max", 5))
+
+        # Motion limits
+        self._v_max = float(policy_cfg.get("v_max", 3.7))
+        self._w_max = float(policy_cfg.get("w_max", 2.0))
+
+        # Navigation config
+        self._nav_enabled = bool(policy_cfg.get("nav_enabled", True))
+        self._nav_replan_s = float(policy_cfg.get("nav_replan_s", 1.0))
+        self._nav_turn_in_place_rad = float(policy_cfg.get("nav_turn_in_place_rad", 1.05))
+        self._nav_slow_dist_m = float(policy_cfg.get("nav_slow_dist_m", 1.2))
+        self._nav_wp_reach_m = float(policy_cfg.get("nav_wp_reach_m", 0.35))
+        self._nav_lookahead_m = float(policy_cfg.get("nav_lookahead_m", 1.5))
+        self._nav_inflation_m = float(policy_cfg.get("nav_inflation_m", 0.45))
+        self._nav_max_astar = int(policy_cfg.get("nav_max_astar", 80_000))
+
+        # Stuck recovery
+        self._stuck_window_s = float(policy_cfg.get("stuck_window_s", 1.2))
+        self._stuck_disp_m = float(policy_cfg.get("stuck_disp_m", 0.12))
+        self._stuck_recover_s = float(policy_cfg.get("stuck_recover_s", 1.0))
+
+        # Coverage/goal robustness
+        self._max_goal_failures = int(policy_cfg.get('max_goal_failures', 3))
+        self._recover_back_steps = int(policy_cfg.get('recover_back_steps', 6))
+        self._recover_back_v = float(policy_cfg.get('recover_back_v', 0.6))
+
+        # Internal state
+        self._seed = 0
+        self._theta = "drift_pos_x"
+
+        self._occ: Optional[np.ndarray] = None
+        self._occ_infl: Optional[np.ndarray] = None
+        self._rooms: Dict[str, Any] = {}
+        self._doors: Dict[str, Any] = {}
+        self._room_centers: Dict[str, Tuple[float, float]] = {}
+        self._room_goal_xy: Dict[str, Tuple[float, float]] = {}
+        self._goal_fail_counts: Dict[str, int] = {}
+        self._tour: List[str] = []
+        self._tour_idx: int = 0
+        self._visited: Set[str] = set()
+        self._blocked_rooms: Set[str] = set()
+
+        # focus state
+        self._focus_active: bool = False
+        self._focus_queue: List[str] = []
+        self._goal_room: Optional[str] = None
+        self._goal_start_t: float = -1e9
+
+        # tier1 bookkeeping
+        self._last_tier1_event_t: float = -1e9
+        self._last_alarm_set: Set[str] = set()
+
+        # timing + budgets
+        self._last_plan_t: float = -1e9
+        self._last_action: Dict[str, Any] = {"type": "velocity", "v": 0.0, "w": 0.0, "action_id": "ours_init"}
+        self._budget_steps: int = 0
+        self._budget_plan_ms: float = 0.0
+
+        # nav path cache
+        self._nav_path: Optional[_NavPath] = None
+
+        # for stuck detection
+        self._pose_hist: Deque[Tuple[float, float, float]] = deque(maxlen=200)
+        self._last_t: Optional[float] = None
+        self._recover_steps_left: int = 0
+        self._recover_back_steps_left: int = 0
+        self._recover_w: float = 0.0
+        self._recover_toggle: bool = False
+
+        # geom
+        self._origin_xy: Tuple[float, float] = (0.0, 0.0)
+        self._res: float = 0.2
+
+    def reset(self, seed: int, scenario_spec: Dict[str, Any]) -> None:
+        super().reset(seed, scenario_spec)
+        self._seed = int(seed)
+        self._theta = str(scenario_spec.get("hvac", {}).get("theta_true", "drift_pos_x"))
+
+        # layout
+        occ, rooms, doors, _nav = reconstruct_layout_from_spec(scenario_spec)
+        self._occ = occ.astype(np.uint8, copy=True)
+        self._rooms = rooms
+        self._doors = doors
+        self._room_centers = {
+            rid: (float(info["center"][0]), float(info["center"][1])) for rid, info in rooms.items()
+        }
+
+        geom = scenario_spec.get("geom", {})
+        origin = geom.get("origin", [0.0, 0.0])
+        self._origin_xy = (float(origin[0]), float(origin[1]))
+        self._res = float(geom.get("resolution", 0.2))
+
+        # Inflate obstacles based on meters -> cells
+        rad_cells = int(max(1, round(self._nav_inflation_m / max(1e-6, self._res))))
+        self._occ_infl = _inflate_occ(self._occ, rad_cells)
+
+
+        # Snap each room "coverage goal" to nearest free cell on the inflated map.
+        # This avoids getting stuck when a room center lands on an occupied cell after inflation/discretization.
+        self._room_goal_xy = {}
+        self._goal_fail_counts = {}
+        for rid, (cx, cy) in self._room_centers.items():
+            try:
+                gi, gj = world_to_grid(cx, cy, self._res, self._origin_xy)
+                g = _snap_to_free(gi, gj, self._occ_infl, max_r=20)
+                if g is None:
+                    self._room_goal_xy[rid] = (cx, cy)
+                else:
+                    gx, gy = grid_to_world(g[0], g[1], self._res, self._origin_xy)
+                    self._room_goal_xy[rid] = (float(gx), float(gy))
+            except Exception:
+                self._room_goal_xy[rid] = (cx, cy)
+            self._goal_fail_counts[rid] = 0
+
+        # Tour order (match Coverage: deterministic sorted room IDs)
+        self._tour = sorted(list(self._room_centers.keys()))
+        self._tour_idx = 0
+        self._visited = set()
+        self._blocked_rooms = set()
+
+        # focus
+        self._focus_active = False
+        self._focus_queue = []
+        self._goal_room = None
+        self._goal_start_t = -1e9
+
+        self._last_tier1_event_t = -1e9
+        self._last_alarm_set = set()
+
+        self._last_plan_t = -1e9
+        self._last_action = {"type": "velocity", "v": 0.0, "w": 0.0, "action_id": "ours_init"}
+        self._budget_steps = 0
+        self._budget_plan_ms = 0.0
+
+        self._nav_path = None
+        self._pose_hist.clear()
+        self._last_t = None
+        self._recover_steps_left = 0
+        self._recover_back_steps_left = 0
+        self._recover_w = 0.0
+
+    def step(
+        self,
+        t: float,
+        pose: Dict[str, float],
+        measurement: Dict[str, float],
+        belief_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        # planning rate limit
+        if (t - self._last_plan_t) < (1.0 / max(1e-9, self._plan_hz)):
+            return self._last_action
+        self._last_plan_t = float(t)
+
+        t0 = time.perf_counter()
+
+        x, y, yaw = float(pose["x"]), float(pose["y"]), float(pose.get("yaw", pose.get("theta", 0.0)))
+        here = (x, y)
+
+        # infer dt for recovery timing
+        if self._last_t is None:
+            dt = 0.1
+        else:
+            dt = float(max(1e-6, t - self._last_t))
+        self._last_t = float(t)
+
+        # record pose history
+        self._pose_hist.append((float(t), x, y))
+
+        # mark goal reached
+        if self._goal_room is not None and self._goal_room in self._room_centers:
+            gx, gy = self._room_goal_xy.get(self._goal_room, self._room_centers[self._goal_room])
+            if math.hypot(x - gx, y - gy) <= self._visit_tol:
+                self._visited.add(self._goal_room)
+                self._goal_fail_counts[self._goal_room] = 0
+                # consume from focus queue if it was focus
+                if self._focus_active and self._focus_queue and self._focus_queue[0] == self._goal_room:
+                    self._focus_queue.pop(0)
+                # advance tour if matching
+                if self._tour and self._tour_idx < len(self._tour) and self._tour[self._tour_idx] == self._goal_room:
+                    self._tour_idx = (self._tour_idx + 1) % max(1, len(self._tour))
+                # clear commitment
+                self._goal_room = None
+                self._goal_start_t = -1e9
+                # clear nav path (goal changed)
+                self._nav_path = None
+
+        # extract tier1 + posterior room mass
+        room_mass, tier1 = self._extract_belief(belief_summary)
+
+        # maybe trigger focus on Tier1 change
+        alarm_rooms, alarm_set, newest_event_t = self._parse_tier1_rooms(tier1)
+        tier1_changed = (newest_event_t > self._last_tier1_event_t + 1e-9) or (alarm_set != self._last_alarm_set)
+
+        if self._focus_on_tier1 and tier1_changed and len(alarm_rooms) > 0:
+            # add new alarm rooms to focus queue, keep ordering by event time (newest first)
+            # but avoid duplicates and rooms already visited/blocked
+            for rid in alarm_rooms:
+                if rid in self._visited or rid in self._blocked_rooms:
+                    continue
+                if rid not in self._focus_queue:
+                    self._focus_queue.append(rid)
+            self._focus_queue = self._focus_queue[: self._focus_queue_max]
+            self._focus_active = True
+            self._last_tier1_event_t = newest_event_t
+            self._last_alarm_set = set(alarm_set)
+
+        # expire focus if held too long / queue empty
+        if self._focus_active:
+            if (t - self._goal_start_t) > self._focus_max_hold_s and self._goal_room is not None:
+                # give up current focus room
+                self._blocked_rooms.add(self._goal_room)
+                if self._focus_queue and self._focus_queue[0] == self._goal_room:
+                    self._focus_queue.pop(0)
+                self._goal_room = None
+                self._goal_start_t = -1e9
+                self._nav_path = None
+            if len(self._focus_queue) == 0:
+                self._focus_active = False
+
+        # choose goal room (commitment)
+        if self._goal_room is None or (t - self._goal_start_t) > self._commit_min_s:
+            self._goal_room = self._select_goal_room(
+                here=here,
+                room_mass=room_mass,
+                focus_queue=self._focus_queue,
+                focus_active=self._focus_active,
+            )
+            self._goal_start_t = float(t)
+            self._nav_path = None
+
+        # fallback: if no rooms exist
+        if self._goal_room is None or self._goal_room not in self._room_centers:
+            out = {"type": "velocity", "v": 0.0, "w": 0.0, "action_id": "ours_idle"}
+            self._last_action = out
+            planning_ms = (time.perf_counter() - t0) * 1000.0
+            self.record_planning_ms(planning_ms)
+            self._budget_steps += 1
+            self._budget_plan_ms += planning_ms
+            return out
+
+        gx, gy = self._room_goal_xy.get(self._goal_room, self._room_centers[self._goal_room])
+
+        # action_id for tracing
+        if self._focus_active and self._focus_queue and self._goal_room == self._focus_queue[0]:
+            action_id = f"ours_focus_{self._goal_room}_a3"
+        else:
+            action_id = f"ours_cov_{self._goal_room}_a0"
+
+        # motion: use navigation to reach (gx,gy)
+        v, w = self._nav_to_goal(
+            t=float(t),
+            dt=float(dt),
+            here_xy=(x, y),
+            yaw=float(yaw),
+            goal_xy=(float(gx), float(gy)),
+            goal_room=self._goal_room,
+        )
+
+        out = {"type": "velocity", "v": float(v), "w": float(w), "action_id": action_id}
+        self._last_action = out
+
+        planning_ms = (time.perf_counter() - t0) * 1000.0
+        self.record_planning_ms(planning_ms)
+        self._budget_steps += 1
+        self._budget_plan_ms += planning_ms
+        return out
+
+    # ------------------------ high level selection ------------------------
+
+    def _select_goal_room(
+        self,
+        here: Tuple[float, float],
+        room_mass: Dict[str, float],
+        focus_queue: List[str],
+        focus_active: bool,
+    ) -> Optional[str]:
+        # Focus mode: go to first queued room if exists
+        if focus_active and len(focus_queue) > 0:
+            for rid in focus_queue:
+                if rid not in self._visited and rid not in self._blocked_rooms:
+                    return rid
+
+        # Otherwise: coverage tour with posterior tie-break
+        if len(self._tour) == 0:
+            return None
+
+        # pick next unvisited in tour
+        for k in range(len(self._tour)):
+            rid = self._tour[(self._tour_idx + k) % len(self._tour)]
+            if rid in self._visited or rid in self._blocked_rooms:
+                continue
+            return rid
+
+        # all visited -> restart tour
+        self._visited = set()
+        self._blocked_rooms = set()
+        return self._tour[self._tour_idx]
+
+    # ------------------------ belief parsing ------------------------
+
+    def _extract_belief(self, belief_summary: Optional[Dict[str, Any]]) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        if belief_summary is None:
+            return {}, {}
+        room_mass = belief_summary.get("posterior_room_mass", {}) or {}
+        tier1 = belief_summary.get("tier1", {}) or {}
+        # ensure float
+        rm2: Dict[str, float] = {}
+        for k, v in room_mass.items():
+            try:
+                rm2[str(k)] = float(v)
+            except Exception:
+                pass
+        return rm2, tier1
+
+    def _parse_tier1_rooms(self, tier1: Dict[str, Any]) -> Tuple[List[str], Set[str], float]:
+        """Return (rooms_sorted_by_newest_event, alarm_set, newest_event_t)."""
+        alarms = tier1.get("alarms", {}) if isinstance(tier1, dict) else {}
+        items: List[Tuple[float, str]] = []
+        alarm_set: Set[str] = set()
+        newest = -1e9
+        if isinstance(alarms, dict):
+            for rid, info in alarms.items():
+                alarm_set.add(str(rid))
+                if isinstance(info, dict):
+                    t_evt = float(info.get("t", -1e9))
+                else:
+                    # sometimes it might be a raw timestamp
+                    try:
+                        t_evt = float(info)
+                    except Exception:
+                        t_evt = -1e9
+                newest = max(newest, t_evt)
+                items.append((t_evt, str(rid)))
+
+        # newest first
+        items.sort(key=lambda x: x[0], reverse=True)
+        alarm_rooms = [rid for _t, rid in items]
+        return alarm_rooms, alarm_set, newest
+
+    # ------------------------ navigation + control ------------------------
+
+    def _nav_to_goal(
+        self,
+        t: float,
+        dt: float,
+        here_xy: Tuple[float, float],
+        yaw: float,
+        goal_xy: Tuple[float, float],
+        goal_room: str,
+    ) -> Tuple[float, float]:
+        """Return (v,w) toward goal_xy using occupancy-grid pathing."""
+
+        # recovery mode
+        if self._recover_steps_left > 0:
+            self._recover_steps_left -= 1
+            if self._recover_back_steps_left > 0:
+                self._recover_back_steps_left -= 1
+                # back up a bit to break contact with walls before re-rotating
+                return -float(self._recover_back_v), 0.0
+            return 0.0, float(self._recover_w)
+
+        # detect stuck
+        if self._is_stuck(now_t=t):
+            # Count failures for this goal so we can eventually skip clearly bad goals.
+            if goal_room is not None:
+                self._goal_fail_counts[goal_room] = self._goal_fail_counts.get(goal_room, 0) + 1
+                if self._goal_fail_counts[goal_room] >= self._max_goal_failures:
+                    self._blocked_rooms.add(goal_room)
+                    # force re-select next step
+                    self._goal_room = None
+                    self._nav_path = None
+                    self._recover_steps_left = 0
+                    self._recover_back_steps_left = 0
+                    return 0.0, 0.0
+
+            self._recover_steps_left = int(max(1, round(self._stuck_recover_s / max(1e-6, dt))))
+            self._recover_back_steps_left = int(min(self._recover_back_steps, self._recover_steps_left))
+            self._recover_toggle = not self._recover_toggle
+            self._recover_w = (1.0 if self._recover_toggle else -1.0) * self._w_max
+            self._nav_path = None
+            return -float(self._recover_back_v) if self._recover_back_steps_left > 0 else 0.0, float(self._recover_w)
+
+        if (not self._nav_enabled) or (self._occ_infl is None):
+            return self._direct_controller(here_xy, yaw, goal_xy)
+
+        # Plan / replan if needed
+        need_plan = False
+        if self._nav_path is None:
+            need_plan = True
+        else:
+            # goal changed significantly
+            if _hypot2(goal_xy[0] - self._nav_path.goal_xy[0], goal_xy[1] - self._nav_path.goal_xy[1]) > 0.25 * 0.25:
+                need_plan = True
+            elif (t - self._nav_path.planned_t) > self._nav_replan_s:
+                need_plan = True
+
+        if need_plan:
+            ok = self._plan_path(here_xy=here_xy, goal_xy=goal_xy, t=t)
+            if not ok:
+                # If unreachable, don't immediately give up: count failures and skip after a few tries.
+                if goal_room is not None:
+                    self._goal_fail_counts[goal_room] = self._goal_fail_counts.get(goal_room, 0) + 1
+                    if self._goal_fail_counts[goal_room] >= self._max_goal_failures:
+                        self._blocked_rooms.add(goal_room)
+                        # force re-select next step
+                        self._goal_room = None
+                self._nav_path = None
+                return self._direct_controller(pose, target_xy=goal_xy, dt=dt)
+
+        assert self._nav_path is not None
+
+        # advance idx
+        while self._nav_path.idx < (len(self._nav_path.xy) - 1):
+            wx, wy = self._nav_path.xy[self._nav_path.idx]
+            if math.hypot(here_xy[0] - wx, here_xy[1] - wy) <= self._nav_wp_reach_m:
+                self._nav_path.idx += 1
+            else:
+                break
+
+        # choose lookahead target with LOS
+        target_xy = goal_xy
+        if len(self._nav_path.cells) > 0:
+            target_xy = self._choose_los_target(here_xy, self._nav_path)
+
+        return self._safe_controller(here_xy, yaw, target_xy)
+
+    def _plan_path(self, here_xy: Tuple[float, float], goal_xy: Tuple[float, float], t: float) -> bool:
+        if self._occ_infl is None:
+            return False
+
+        si, sj = world_to_grid(here_xy[0], here_xy[1], self._res, self._origin_xy)
+        gi, gj = world_to_grid(goal_xy[0], goal_xy[1], self._res, self._origin_xy)
+
+        si = int(_clamp(si, 0, self._occ_infl.shape[0] - 1))
+        sj = int(_clamp(sj, 0, self._occ_infl.shape[1] - 1))
+        gi = int(_clamp(gi, 0, self._occ_infl.shape[0] - 1))
+        gj = int(_clamp(gj, 0, self._occ_infl.shape[1] - 1))
+
+        s2 = _snap_to_free(si, sj, self._occ_infl)
+        g2 = _snap_to_free(gi, gj, self._occ_infl)
+        if s2 is None or g2 is None:
+            return False
+
+        cells = _astar_grid(self._occ_infl, s2, g2, max_expansions=self._nav_max_astar)
+        if cells is None or len(cells) == 0:
+            return False
+
+        # compress for stability
+        cells_c = _compress_path_cells(cells)
+        xy = [grid_to_world(ci, cj, self._res, self._origin_xy) for (ci, cj) in cells_c]
+
+        self._nav_path = _NavPath(goal_xy=goal_xy, cells=cells_c, xy=xy, idx=0, planned_t=float(t))
+        return True
+
+    def _choose_los_target(self, here_xy: Tuple[float, float], nav: _NavPath) -> Tuple[float, float]:
+        assert self._occ_infl is not None
+
+        hi, hj = world_to_grid(here_xy[0], here_xy[1], self._res, self._origin_xy)
+        hi = int(_clamp(hi, 0, self._occ_infl.shape[0] - 1))
+        hj = int(_clamp(hj, 0, self._occ_infl.shape[1] - 1))
+
+        lookahead_cells = int(max(3, round(self._nav_lookahead_m / max(1e-6, self._res))))
+        end = min(len(nav.cells) - 1, nav.idx + lookahead_cells)
+
+        # search from farthest to nearest for LOS
+        for k in range(end, nav.idx - 1, -1):
+            ti, tj = nav.cells[k]
+            if self._line_of_sight_free(hi, hj, ti, tj):
+                return nav.xy[k]
+
+        return nav.xy[nav.idx]
+
+    def _line_of_sight_free(self, i0: int, j0: int, i1: int, j1: int) -> bool:
+        assert self._occ_infl is not None
+        h, w = self._occ_infl.shape
+        for (i, j) in _bresenham(i0, j0, i1, j1):
+            if i < 0 or i >= h or j < 0 or j >= w:
+                return False
+            if self._occ_infl[i, j] != 0:
+                return False
+        return True
+
+    def _safe_controller(self, here_xy: Tuple[float, float], yaw: float, target_xy: Tuple[float, float]) -> Tuple[float, float]:
+        dx = target_xy[0] - here_xy[0]
+        dy = target_xy[1] - here_xy[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return 0.0, 0.0
+
+        desired = math.atan2(dy, dx)
+        err = _wrap_pi(desired - yaw)
+
+        # angular control
+        k_turn = 2.2
+        w = _clamp(k_turn * err, -self._w_max, self._w_max)
+
+        # rotate in place if facing away (prevents corner-cutting)
+        if abs(err) > self._nav_turn_in_place_rad:
+            return 0.0, float(w)
+
+        # forward speed scaling
+        # - slow when turning
+        # - slow near the current local target
+        turn_scale = max(0.0, math.cos(err))  # err in [-~60deg,~60deg] after guard
+        dist_scale = min(1.0, dist / max(1e-6, self._nav_slow_dist_m))
+        v = self._v_max * turn_scale * dist_scale
+
+        # keep a small minimum when we're roughly aligned, so we don't stall
+        if abs(err) < 0.35:
+            v = max(v, 0.25)
+
+        return float(_clamp(v, -self._v_max, self._v_max)), float(w)
+
+    def _direct_controller(self, here_xy: Tuple[float, float], yaw: float, goal_xy: Tuple[float, float]) -> Tuple[float, float]:
+        """Fallback: simple goal-heading (old behavior)."""
+        dx = goal_xy[0] - here_xy[0]
+        dy = goal_xy[1] - here_xy[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return 0.0, 0.0
+
+        desired = math.atan2(dy, dx)
+        err = _wrap_pi(desired - yaw)
+        w = _clamp(2.0 * err, -self._w_max, self._w_max)
+
+        v = self._v_max * max(0.0, math.cos(err))
+        if abs(err) > 1.0:
+            v *= 0.2
+        return float(_clamp(v, -self._v_max, self._v_max)), float(w)
+
+    def _is_stuck(self, now_t: float) -> bool:
+        """Detect being stuck by low displacement over a short time window."""
+        if len(self._pose_hist) < 3:
+            return False
+        # collect poses in window
+        t_min = now_t - self._stuck_window_s
+        xs: List[float] = []
+        ys: List[float] = []
+        for (tt, x, y) in self._pose_hist:
+            if tt >= t_min:
+                xs.append(x)
+                ys.append(y)
+        if len(xs) < 3:
+            return False
+        dx = max(xs) - min(xs)
+        dy = max(ys) - min(ys)
+        disp = math.hypot(dx, dy)
+        return disp < self._stuck_disp_m
+
+    # ------------------------ budget stats ------------------------
+
+    def get_budget_stats(self) -> Dict[str, Any]:
+        """Return base budget stats + a few extras.
+
+        IMPORTANT: runner expects the fixed keys from Policy.get_budget_stats():
+          planning_hz, candidates, rollouts, inference_ms_mean, planning_ms_mean
+        """
+        s = super().get_budget_stats()
+        # Align planning_hz with our actual replanning rate limiter.
+        s["planning_hz"] = float(self._plan_hz)
+        # Extra debug fields (safe to add).
+        s["nav_enabled"] = bool(self._nav_enabled)
+        s["avg_plan_ms_local"] = float(self._budget_plan_ms / max(1, self._budget_steps))
+        return s
