@@ -1,0 +1,130 @@
+"""Plot a 2D debug map for a single trial trace.
+
+Usage (from repo root):
+  py tools\plot_trial_2d.py --trace results\exp_e1_lite\...\trace.csv
+
+It will produce a PNG next to the trace (default: debug_map.png) with:
+- occupancy map (black = obstacle/wall, white = free)
+- robot trajectory
+- start (blue dot)
+- leak position (orange star)
+
+This tool intentionally has *no* dependency on your experiment folder name
+(v10/v11/...). It only needs the trace path because that folder also contains
+scenario_spec.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def _repo_root() -> str:
+    # tools/plot_trial_2d.py -> repo root
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+# Make "fab_benchmark" importable even when running the script directly.
+sys.path.insert(0, _repo_root())
+
+from fab_benchmark.scenarios.base_scenario import build_scene_dict_from_scenario_spec
+
+
+def _resolve_trace_path(p: str) -> Path:
+    tp = Path(p)
+    if tp.is_dir():
+        tp = tp / "trace.csv"
+    return tp
+
+
+def _find_scenario_spec(trace_csv: Path) -> Path:
+    # In this repo, trace.csv lives beside scenario_spec.json
+    cand = trace_csv.parent / "scenario_spec.json"
+    if cand.exists():
+        return cand
+    # fallback: sometimes people pass a directory above
+    cand2 = trace_csv.parent.parent / "scenario_spec.json"
+    if cand2.exists():
+        return cand2
+    raise FileNotFoundError(f"scenario_spec.json not found near: {trace_csv}")
+
+
+def _load_trace_xy(trace_csv: Path) -> tuple[np.ndarray, np.ndarray]:
+    xs, ys = [], []
+    with trace_csv.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError("trace.csv has no header")
+        # Common header names in this repo
+        x_key = "x" if "x" in reader.fieldnames else "pos_x"
+        y_key = "y" if "y" in reader.fieldnames else "pos_y"
+        for row in reader:
+            try:
+                xs.append(float(row[x_key]))
+                ys.append(float(row[y_key]))
+            except Exception:
+                continue
+    return np.asarray(xs), np.asarray(ys)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trace", required=True, help="Path to trace.csv (or its folder)")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="Output PNG path. Default: <trace_dir>/debug_map.png",
+    )
+    args = ap.parse_args()
+
+    trace_csv = _resolve_trace_path(args.trace)
+    if not trace_csv.exists():
+        raise FileNotFoundError(str(trace_csv))
+
+    spec_path = _find_scenario_spec(trace_csv)
+    scenario_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    scene = build_scene_dict_from_scenario_spec(scenario_spec)
+
+    occ = np.asarray(scene["occupancy"], dtype=np.uint8)
+    origin = np.asarray(scene.get("origin", [0.0, 0.0]), dtype=float)
+    res = float(scene.get("resolution", scenario_spec.get("geom", {}).get("resolution", 0.2)))
+
+    xs, ys = _load_trace_xy(trace_csv)
+    if xs.size == 0:
+        raise ValueError("No trajectory points found in trace.csv")
+
+    leak = scenario_spec.get("leak", {}).get("pos", [np.nan, np.nan, np.nan])
+    leak_x, leak_y = float(leak[0]), float(leak[1])
+
+    # Display occupancy: black=obstacle, white=free.
+    # In this repo: occupancy is 0=free, 1=wall. So use gray_r (reversed).
+    H, W = occ.shape
+    extent = [origin[0], origin[0] + W * res, origin[1], origin[1] + H * res]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.imshow(occ, cmap="gray_r", origin="lower", extent=extent, interpolation="nearest")
+    ax.plot(xs, ys)
+    ax.plot([xs[0]], [ys[0]], marker="o")
+    if np.isfinite(leak_x) and np.isfinite(leak_y):
+        ax.plot([leak_x], [leak_y], marker="*", markersize=14)
+    ax.set_aspect("equal")
+    ax.set_title(trace_csv.parent.name)
+
+    out = Path(args.out) if args.out else (trace_csv.parent / "debug_map.png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    print(str(out))
+
+
+if __name__ == "__main__":
+    main()

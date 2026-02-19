@@ -1,0 +1,35 @@
+version: "v1"
+
+sim_params:
+  t_end: 60.0
+  dt_physics: 0.0166666667
+  substeps: 2
+  control_hz: 10.0
+  robot:
+    v_max: 0.8
+    w_max: 1.2
+    base_height_z: 0.30
+  isaac:
+    headless: 1
+    render: 0
+    enable_rtx: 0
+    go2_usd_path: "data/unitree_go2/usd/go2.usd"
+  belief:
+    cell_stride: 2
+    z_bin_height: 0.8
+    p_cut: 0.002
+
+experiment:
+  exp_id: "e0_smoke"
+  seed0: 123
+  trials_per_condition: 10
+  methods: ["Ours"]
+  condition_sweep:
+    scenario_family: ["F1"]
+    hvac_theta_true: ["uniform"]
+    doors_pattern_id: ["all_open"]
+    leak_enabled: [1]
+
+policies:
+  Ours: {}
+  Dummy: {}

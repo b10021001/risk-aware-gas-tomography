@@ -1,0 +1,129 @@
+{
+  "version": "v1",
+  "sim_params": {
+    "t_end": 120.0,
+    "dt_physics": 0.0166666667,
+    "substeps": 2,
+    "control_hz": 10.0,
+    "robot": {
+      "v_max": 1.0,
+      "w_max": 1.5,
+      "base_height_z": 0.35,
+      "collision_recovery": {
+        "enabled": 1,
+        "backoff_time": 1.0,
+        "turn_in_place_time": 1.0,
+        "backoff_v": -0.2,
+        "turn_w": 0.8
+      }
+    },
+    "isaac": {
+      "headless": 1,
+      "render": 0,
+      "enable_rtx": 0,
+      "go2_usd_path": "data/go2.usd"
+    },
+    "belief": {
+      "cell_stride": 2,
+      "z_bin_height": 0.8,
+      "p_cut": 0.002
+    }
+  },
+  "experiment": {
+    "exp_id": "e2",
+    "trials_per_condition": 50,
+    "methods": [
+      "Coverage",
+      "Greedy",
+      "Infotaxis",
+      "Informative_NoRisk",
+      "Ours",
+      "Ours_NoDelayModel"
+    ],
+    "condition_sweep": {
+      "scenario_families": [
+        "F2"
+      ],
+      "scenario_params": {
+        "F2": {
+          "rooms_n": 14
+        }
+      },
+      "hvac_modes": [
+        "drift_pos_x"
+      ],
+      "door_patterns": [
+        "half_random"
+      ],
+      "door_mismatch": 1,
+      "door_assumed_pattern": "all_open"
+    },
+    "seed0": 1000
+  },
+  "policies": {
+    "Ours": {
+      "info_gain_metric": "entropy_drop",
+      "risk_quantile": 0.9,
+      "E_max": 1.5,
+      "delta": 0.1,
+      "lambda_risk": 1.0,
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Coverage": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 1,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Greedy": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Infotaxis": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Informative_NoRisk": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Ours_NoDelayModel": {
+      "info_gain_metric": "entropy_drop",
+      "risk_quantile": 0.9,
+      "E_max": 1.5,
+      "delta": 0.1,
+      "lambda_risk": 1.0,
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,229 @@
+{
+  "version": "v1",
+  "sim_params": {
+    "t_end": 60.0,
+    "dt_physics": 0.0166666667,
+    "substeps": 2,
+    "control_hz": 10.0,
+    "robot": {
+      "v_max": 1.0,
+      "w_max": 1.5,
+      "base_height_z": 0.35,
+      "collision_recovery": {
+        "enabled": 1,
+        "backoff_time": 1.0,
+        "turn_in_place_time": 1.0,
+        "backoff_v": -0.2,
+        "turn_w": 0.8
+      }
+    },
+    "isaac": {
+      "headless": 1,
+      "render": 0,
+      "enable_rtx": 0,
+      "go2_usd_path": "data/unitree_go2/usd/go2.usd"
+    },
+    "belief": {
+      "cell_stride": 2,
+      "z_bin_height": 0.8,
+      "p_cut": 0.002
+    }
+  },
+  "experiment": {
+    "scenario_spec": {
+      "scenario_family": "F1",
+      "scenario_id": "f1_0000",
+      "generator": {
+        "seed": 0,
+        "params": {}
+      },
+      "map": {
+        "resolution": 0.2,
+        "size": [
+          80,
+          80
+        ]
+      },
+      "doors": {
+        "pattern_id": "all_open",
+        "states": {
+          "D00": 1,
+          "D01": 1,
+          "D02": 1,
+          "D03": 1,
+          "D04": 1
+        },
+        "door_geoms": {
+          "D00": {
+            "p0": [
+              12.9,
+              11.500000000000002
+            ],
+            "p1": [
+              12.9,
+              12.700000000000001
+            ],
+            "z_bottom": 0.0,
+            "height": 2.2,
+            "thickness": 0.05
+          },
+          "D01": {
+            "p0": [
+              12.700000000000001,
+              5.7
+            ],
+            "p1": [
+              13.9,
+              5.7
+            ],
+            "z_bottom": 0.0,
+            "height": 2.2,
+            "thickness": 0.05
+          },
+          "D02": {
+            "p0": [
+              12.9,
+              3.5000000000000004
+            ],
+            "p1": [
+              12.9,
+              4.7
+            ],
+            "z_bottom": 0.0,
+            "height": 2.2,
+            "thickness": 0.05
+          },
+          "D03": {
+            "p0": [
+              8.3,
+              11.500000000000002
+            ],
+            "p1": [
+              8.3,
+              12.700000000000001
+            ],
+            "z_bottom": 0.0,
+            "height": 2.2,
+            "thickness": 0.05
+          },
+          "D04": {
+            "p0": [
+              12.9,
+              3.5000000000000004
+            ],
+            "p1": [
+              12.9,
+              4.7
+            ],
+            "z_bottom": 0.0,
+            "height": 2.2,
+            "thickness": 0.05
+          }
+        }
+      },
+      "hvac": {
+        "theta_true": "drift_pos_x",
+        "theta_library": [
+          "drift_pos_x",
+          "vortex_ccw",
+          "time_switch"
+        ],
+        "mode_params": {
+          "drift_speed": 0.6,
+          "vortex_strength": 0.35,
+          "time_switch_t": 30.0
+        }
+      },
+      "leak": {
+        "enabled": 1,
+        "room_id": "R00",
+        "pos": [
+          7.9,
+          12.0,
+          1.0
+        ],
+        "q": 0.2,
+        "start_time": 0.0
+      },
+      "sensor": {
+        "tau": 2.0,
+        "sigma": 0.03,
+        "drift": {
+          "enabled": 0,
+          "rate": 0.001,
+          "bias0": 0.0
+        }
+      }
+    },
+    "exp_id": "e0_smoke",
+    "seed": 0,
+    "policy_name": "Ours",
+    "trial_id": "f1_smoke_seed0"
+  },
+  "policies": {
+    "Ours": {
+      "info_gain_metric": "entropy_drop",
+      "risk_quantile": 0.9,
+      "E_max": 1.5,
+      "delta": 0.1,
+      "lambda_risk": 1.0,
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Coverage": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 1,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Greedy": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Infotaxis": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Informative_NoRisk": {
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    },
+    "Ours_NoDelayModel": {
+      "info_gain_metric": "entropy_drop",
+      "risk_quantile": 0.9,
+      "E_max": 1.5,
+      "delta": 0.1,
+      "lambda_risk": 1.0,
+      "planning_budget": {
+        "planning_hz": 2.0,
+        "candidates": 32,
+        "horizon_steps": 10,
+        "local_perturb_radius": 1.0,
+        "rollout_count": 0
+      }
+    }
+  }
+}
