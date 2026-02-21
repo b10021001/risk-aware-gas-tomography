@@ -1,0 +1,63 @@
+# configs/exp_e2.yaml
+# E2 (OOD) experiment configuration (public artifact)
+
+experiment:
+  id: E2
+  setting: OOD
+  n_trials: 600
+  time_cap_s: 60.0
+  success_threshold_m: 2.0
+  exposure_budget_ndu: 60.0
+  delta_step: 0.05
+
+planner:
+  replanning_rate_hz: [1.0, 2.0]
+  belief_update_rate_hz: [5.0, 10.0]
+  horizon_s: 6.0
+  n_candidates: 32
+  utility: "information_gain_proxy"
+  fallback_supervisor: true
+
+risk:
+  n_scenarios: 64
+  quantile: 0.95
+  certification:
+    enabled: false
+
+sensor:
+  sampling_dt_s: 0.1
+  tau_s_range: [0.5, 5.0]   # OOD includes larger lag stress tests
+  noise_sigma: 0.05
+  drift_sigma: 0.01
+
+gt_generator:
+  # OOD introduces controlled shifts and GT-only effects (Table X).
+  mode_library: ["M1", "M2", "M3", "M4"]   # true mode may switch within episode
+  hvac_strength_range: [0.75, 1.30]
+  door_p_close_range: [0.50, 0.70]
+  door_bottlenecks_max: 4
+  leak_z_m_range: [0.2, 2.0]
+  leak_q_scale_choices: [1.0, 1.3, 2.0, 3.0]
+  gt_only_effects:
+    enable: true
+    mode_switching:
+      enabled: true
+      max_switches: 2
+      switch_time_s_range: [10.0, 50.0]
+      strength_jitter_range: [0.85, 1.15]
+    spatial_dispersion:
+      enabled: true
+      delta_range: [0.10, 0.30]
+      corr_len_m_range: [2.0, 5.0]
+    stochastic_fluctuations:
+      enabled: true
+      sigma_range: [0.08, 0.15]
+      corr_time_s_range: [0.5, 2.0]
+
+logging:
+  write_gt_episode_json: true
+  write_trace_csv: true
+  write_plan_csv: true
+  write_posterior_summary_csv: true
+  write_timing_csv: true
+  write_manifest_csv: true

@@ -1,0 +1,36 @@
+{
+  "trial_id": "E2_OOD_0142",
+  "seed": 123456,
+  "hvac_mode_gt": "M2",
+  "hvac_strength_gt": 1.3,
+  "door_p_close_gt": 0.72,
+  "door_bottlenecks_gt": [
+    "D12",
+    "D37"
+  ],
+  "leak_s_gt_m": [
+    12.4,
+    -3.1,
+    1.1
+  ],
+  "leak_q_scale_gt": 3.0,
+  "sensor_tau_s": 3.5,
+  "gt_only_effects": {
+    "mode_switch_schedule": [
+      {
+        "t_s": 24.0,
+        "hvac_mode_gt": "M4",
+        "hvac_strength_gt": 1.1
+      }
+    ],
+    "dispersion_scale_field": {
+      "base": 1.0,
+      "delta": 0.25,
+      "corr_len_m": 3.0
+    },
+    "stochastic_fluct": {
+      "sigma": 0.12,
+      "corr_time_s": 1.0
+    }
+  }
+}

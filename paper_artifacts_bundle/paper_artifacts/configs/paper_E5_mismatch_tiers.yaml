@@ -1,0 +1,38 @@
+# configs/mismatch_tiers.yaml
+# E5 mismatch tiers (golden set) definition (public artifact)
+
+tiers:
+  low:
+    description: "mild parameter/discretization bias only"
+    hvac_strength_bias: [0.95, 1.05]
+    dispersion_delta: [0.05, 0.10]
+    stochastic_sigma: [0.00, 0.05]
+    allow_missing_modes: false
+    boundary_bias: "none"
+
+  medium:
+    description: "stronger dispersion bias + mild stochastic variability"
+    hvac_strength_bias: [0.90, 1.10]
+    dispersion_delta: [0.10, 0.20]
+    stochastic_sigma: [0.05, 0.10]
+    allow_missing_modes: false
+    boundary_bias: "mild"
+
+  high:
+    description: "missing/incorrect mode and/or biased boundary conditions"
+    hvac_strength_bias: [0.85, 1.15]
+    dispersion_delta: [0.15, 0.25]
+    stochastic_sigma: [0.08, 0.12]
+    allow_missing_modes: true
+    boundary_bias: "moderate"
+
+  extreme:
+    description: "time-varying mode switching + compounded mismatch"
+    hvac_strength_bias: [0.75, 1.30]
+    dispersion_delta: [0.20, 0.35]
+    stochastic_sigma: [0.10, 0.18]
+    allow_missing_modes: true
+    boundary_bias: "strong"
+    mode_switching:
+      max_switches: 3
+      switch_time_s_range: [5.0, 55.0]
